@@ -91,6 +91,7 @@ static int rtw_dump_physical_efuse_map(struct rtw_dev *rtwdev, u8 *map)
 	u32 efuse_ctl;
 	u32 addr;
 	u32 cnt;
+	s64 read_start_time; // For performance measuring
 
 	rtw_chip_efuse_grant_on(rtwdev);
 
@@ -101,6 +102,7 @@ static int rtw_dump_physical_efuse_map(struct rtw_dev *rtwdev, u8 *map)
 
 	efuse_ctl = rtw_read32(rtwdev, REG_EFUSE_CTRL);
 
+	read_start_time = ktime_to_ms(ktime_get_real());
 	for (addr = 0; addr < size; addr++) {
 		efuse_ctl &= ~(BIT_MASK_EF_DATA | BITS_EF_ADDR);
 		efuse_ctl |= (addr & BIT_MASK_EF_ADDR) << BIT_SHIFT_EF_ADDR;
@@ -116,6 +118,7 @@ static int rtw_dump_physical_efuse_map(struct rtw_dev *rtwdev, u8 *map)
 
 		*(map + addr) = (u8)(efuse_ctl & BIT_MASK_EF_DATA);
 	}
+	printk(KERN_INFO "Efuse read %d bytes in %lldms\n", size, ktime_to_ms(ktime_get_real()) - read_start_time);
 
 	rtw_chip_efuse_grant_off(rtwdev);
 
@@ -166,12 +169,15 @@ int rtw_parse_efuse_map(struct rtw_dev *rtwdev)
 		goto out_free;
 	}
 
+	// print_hex_dump(KERN_INFO, "rtw_usb: hw efuse ", DUMP_PREFIX_OFFSET, 16, 1, phy_map, phy_size, false);
+
 	memset(log_map, 0xff, log_size);
 	ret = rtw_dump_logical_efuse_map(rtwdev, phy_map, log_map);
 	if (ret) {
 		rtw_err(rtwdev, "failed to dump efuse logical map\n");
 		goto out_free;
 	}
+	// print_hex_dump(KERN_INFO, "rtw_usb: log efuse ", DUMP_PREFIX_OFFSET, 16, 1, log_map, log_size, false);
 
 	ret = chip->ops->read_efuse(rtwdev, log_map);
 	if (ret) {

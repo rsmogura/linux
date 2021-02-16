@@ -78,6 +78,7 @@ static int rtw_mac_pre_system_cfg(struct rtw_dev *rtwdev)
 		rtw_write32_set(rtwdev, REG_HCI_OPT_CTRL, BIT_BT_DIG_CLK_EN);
 		break;
 	case RTW_HCI_TYPE_USB:
+		//??? halmac_init 964
 		break;
 	default:
 		return -EINVAL;
@@ -1267,12 +1268,17 @@ int rtw_mac_init(struct rtw_dev *rtwdev)
 	int ret;
 
 	ret = rtw_init_trx_cfg(rtwdev);
-	if (ret)
+	if (ret) {
+		printk(KERN_INFO "1\n");
 		return ret;
+	}
 
 	ret = chip->ops->mac_init(rtwdev);
-	if (ret)
+	if (ret) {
+		printk(KERN_INFO "2\n");
+
 		return ret;
+}
 
 	ret = rtw_drv_info_cfg(rtwdev);
 	if (ret)

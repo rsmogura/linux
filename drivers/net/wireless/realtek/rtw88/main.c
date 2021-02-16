@@ -917,6 +917,8 @@ int rtw_core_start(struct rtw_dev *rtwdev)
 
 static void rtw_power_off(struct rtw_dev *rtwdev)
 {
+
+	printk(KERN_INFO, "aaaaassssss\n");
 	rtw_hci_stop(rtwdev);
 	rtw_mac_power_off(rtwdev);
 }
@@ -1163,8 +1165,12 @@ static int rtw_chip_parameter_setup(struct rtw_dev *rtwdev)
 		rtwdev->hci.rpwm_addr = 0x03d9;
 		rtwdev->hci.cpwm_addr = 0x03da;
 		break;
+	case RTW_HCI_TYPE_USB:
+		rtwdev->hci.rpwm_addr = 0x03d9;
+		rtwdev->hci.cpwm_addr = 0x03da;
+		break;
 	default:
-		rtw_err(rtwdev, "unsupported hci type\n");
+		rtw_err(rtwdev, "unsupported hci type %d\n", rtw_hci_type(rtwdev));
 		return -EINVAL;
 	}
 
@@ -1280,6 +1286,7 @@ static int rtw_dump_hw_feature(struct rtw_dev *rtwdev)
 
 static void rtw_chip_efuse_disable(struct rtw_dev *rtwdev)
 {
+	printk(KERN_INFO, "aaaaa\n");
 	rtw_hci_stop(rtwdev);
 	rtw_mac_power_off(rtwdev);
 }

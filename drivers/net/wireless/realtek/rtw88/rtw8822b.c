@@ -25,6 +25,19 @@ static void rtw8822be_efuse_parsing(struct rtw_efuse *efuse,
 	ether_addr_copy(efuse->addr, map->e.mac_addr);
 }
 
+static void rtw8822bu_efuse_parsing(struct rtw_efuse *efuse,
+				    struct rtw8822b_efuse *map)
+{
+	ether_addr_copy(efuse->addr, map->u.mac_addr);
+	/* No op.
+	 *
+	 * Two additional USB specific options _can_ be read here:
+	 * - usb mode swith (allow to switch USB speed);
+	 * - eeprovm vid, pid, sdid; not used
+	 * But for now we don't need this data.
+	 */
+}
+
 static int rtw8822b_read_efuse(struct rtw_dev *rtwdev, u8 *log_map)
 {
 	struct rtw_efuse *efuse = &rtwdev->efuse;
@@ -54,6 +67,9 @@ static int rtw8822b_read_efuse(struct rtw_dev *rtwdev, u8 *log_map)
 	switch (rtw_hci_type(rtwdev)) {
 	case RTW_HCI_TYPE_PCIE:
 		rtw8822be_efuse_parsing(efuse, map);
+		break;
+	case RTW_HCI_TYPE_USB:
+		rtw8822bu_efuse_parsing(efuse, map);
 		break;
 	default:
 		/* unsupported now */
