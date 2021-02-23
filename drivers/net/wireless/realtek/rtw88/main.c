@@ -1166,8 +1166,10 @@ static int rtw_chip_parameter_setup(struct rtw_dev *rtwdev)
 		rtwdev->hci.cpwm_addr = 0x03da;
 		break;
 	case RTW_HCI_TYPE_USB:
-		rtwdev->hci.rpwm_addr = 0x03d9;
-		rtwdev->hci.cpwm_addr = 0x03da;
+		// #define REG_USB_HRPWM_8822B		0xFE58
+		// #define REG_USB_HCPWM_8822B		0xFE57
+		rtwdev->hci.rpwm_addr = 0xfe58; //
+		rtwdev->hci.cpwm_addr = 0xfe57;
 		break;
 	default:
 		rtw_err(rtwdev, "unsupported hci type %d\n", rtw_hci_type(rtwdev));
