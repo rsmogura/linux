@@ -1288,7 +1288,6 @@ static int rtw_dump_hw_feature(struct rtw_dev *rtwdev)
 
 static void rtw_chip_efuse_disable(struct rtw_dev *rtwdev)
 {
-	printk(KERN_INFO, "aaaaa\n");
 	rtw_hci_stop(rtwdev);
 	rtw_mac_power_off(rtwdev);
 }

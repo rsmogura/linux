@@ -382,13 +382,14 @@ void rtw_usb_stop(struct rtw_dev *rtwdev) {
 
 void rtw_usb_deep_ps(struct rtw_dev *rtwdev, bool enter) {
 	// TODO Handle it properly
-	if (enter) {
-		set_bit(RTW_FLAG_LEISURE_PS_DEEP, rtwdev->flags);
-		rtw_power_mode_change(rtwdev, true);
-	} else {
-		if (test_and_clear_bit(RTW_FLAG_LEISURE_PS_DEEP, rtwdev->flags))
-			rtw_power_mode_change(rtwdev, false);
-	}
+	// PWR control causes tx issues... maybe it lack of link_ps, or should we wait for tx to finish
+	// if (enter) {
+	// 	set_bit(RTW_FLAG_LEISURE_PS_DEEP, rtwdev->flags);
+	// 	rtw_power_mode_change(rtwdev, true);
+	// } else {
+	// 	if (test_and_clear_bit(RTW_FLAG_LEISURE_PS_DEEP, rtwdev->flags))
+	// 		rtw_power_mode_change(rtwdev, false);
+	// }
 	// Should be stopped completly, rx thread to suspend
 	// WHen suspended on barrier, disconnect should unsuspend it, to prevent deadlock
 	// Check how often jumps into deep_ps (printk)
@@ -422,7 +423,6 @@ static struct urb *rtw_usb_tx_submit(struct rtw_usb_tx_info *tx_info, bool async
 	// printk(KERN_INFO "Submit URB to bus\n");
 	urb = usb_alloc_urb(0, GFP_ATOMIC);
 
-	__le16 fc = ((struct ieee80211_hdr *) skb->data)->frame_control;
 	// Here we should chose an endpoint, but we are fine wiih 0x05
 	// Maybe a reason for 'timed out to flush queue 3', but for now it works...
 	usb_fill_bulk_urb(urb, usb_dev, usb_sndbulkpipe(usb_dev, 0x05), skb->data, skb->len, urb_handler, tx_info);
@@ -443,13 +443,10 @@ static int rtw_usb_tx_schedule(struct rtw_dev *rtwdev,
 	struct rtw_chip_info *chip = rtwdev->chip;
 	struct usb_device* usb_dev = to_usb_device(rtwdev->dev);
 	struct sk_buff *skb = tx_info->skb;
-	unsigned long flags;
 
-	// const u32 tx_pkt_desc_sz = chip->tx_pkt_desc_sz;
-	// const u32 tx_buf_desc_sz = chip->tx_buf_desc_sz;
+	const u32 tx_pkt_desc_sz = chip->tx_pkt_desc_sz;
+	// const u32 tx_buf_desc_sz = chip->tx_buf_desc_sz; //TODO Not needed for USB?
 	
-	int r;
-
 	int i;
 	u16 *chksumdata;
 	u16 chksum = 0;
@@ -458,22 +455,20 @@ static int rtw_usb_tx_schedule(struct rtw_dev *rtwdev,
 	u32 psb_len;
 	u8 *pkt_desc;
 
-	// printk(KERN_INFO "Skb len: %d, header add %hhd\n", skb->len, chip->tx_pkt_desc_sz);
-
-	pkt_desc = skb_push(skb, chip->tx_pkt_desc_sz);
-	memset(pkt_desc, 0, chip->tx_pkt_desc_sz);
+	pkt_desc = skb_push(skb, tx_pkt_desc_sz);
+	memset(pkt_desc, 0, tx_pkt_desc_sz);
 
 	// Finding issu with this took a lot of time
 	pkt_info->qsel = rtw_usb_get_tx_qsel(skb, queue);
 
 	// printk(KERN_INFO "rtv tx__ >>> tx fw queue %hxx, driver queue %hhx kind %s\n", pkt_info->qsel, queue, rtw_usb_get_frame_kind(skb));
 
-
 	//update_txdesc from RTL
 	rtw_tx_fill_tx_desc(pkt_info, skb); 
 
 	//We don't set cheksum here - should we?
 
+	// TODO Move cheksum to inlined function
 	chksumdata = (u16 *) skb->data;
 	for (i = 0; i < 8; i++)
 		chksum ^= (*(chksumdata + 2 * i) ^ *(chksumdata + (2 * i + 1)));
@@ -482,18 +477,14 @@ static int rtw_usb_tx_schedule(struct rtw_dev *rtwdev,
 
 	// When packet is miscconfigured no completion, should we cancle URB than? Do test with sending worng packet before good.
 	
-	
 	tx_info->rtwdev = rtwdev;
 	tx_info->pkt_info = pkt_info;
 	tx_info->queue = queue;
 	tx_info->sn = pkt_info->sn;
-	// spin_lock_irqsave(&rtwubs->tx_queue_lock, flags);
-	// printk(KERN_INFO "Appending tx\n");
-	// list_add_tail(&tx_info->tx_ack_queue, &rtwubs->tx_queue);
-	// spin_unlock_irqrestore(&rtwubs->tx_queue_lock, flags);
 
+	// TODO Error handling
 	rtw_usb_tx_submit(tx_info, false);
-	// printk(KERN_INFO "Header %hhd\n", chip->tx_pkt_desc_sz);
+
 	return 0;
 }
 
@@ -516,7 +507,7 @@ int rtw_usb_write_data_rsvd_page(struct rtw_dev *rtwdev, u8 *buf, u32 size) {
 	struct rtw_tx_pkt_info pkt_info = {0};
 	struct rtw_usb_tx_info *tx_info;
 
-	u8 reg_bcn_work;
+	u8 reg_bcn_work; // TODO Why it's in PCI
 	int ret;
 
 	// TODO Probably we want to cache skb
@@ -560,8 +551,10 @@ int rtw_usb_write_data_h2c(struct rtw_dev *rtwdev, u8 *buf, u32 size) {
 
 	ret = rtw_usb_tx_schedule(rtwdev, &pkt_info, tx_info, RTW_TX_QUEUE_H2C);
 	if (ret) {
-		// TODO PCI version does not de-allocate...
+		//TODO Who should deallpcate buf?
 		rtw_err(rtwdev, "failed to write h2c data %d\n", ret);
+
+		dev_kfree_skb_any(skb);
 		return ret;
 	}
 
@@ -586,7 +579,7 @@ inline static int rtw_usb_rw_request(struct rtw_dev *rtwdev, enum rtw_usb_rw_req
 
 	u8 usb_req_type; // Vendor specific request type (read or write)
 	int io_stat, io_stat2; // Status / number of bytes read / wrote
-	int repeat_count = 0;
+	// int repeat_count = 0;
 
 	u8  *u8_io  = (u8 *)  in_out; // Pointer cast
 	u16 *u16_io = (u16 *) in_out; // Pointer cast
@@ -618,33 +611,8 @@ inline static int rtw_usb_rw_request(struct rtw_dev *rtwdev, enum rtw_usb_rw_req
 	}
 
 	// TODO Elaborate on repeat more
-	// TODO When this device was conencted to quemu (USB 2.0) it always fiald to set-up, need to check if this is case for physicall device, and bail out fast during probe
-
 	// for (repeat_count = 0; repeat_count < 5; repeat_count++) {
-	// urb = usb_alloc_urb(0, GFP_ATOMIC);
-	// struct usb_ctrlrequest *dr = kmalloc(sizeof(struct usb_ctrlrequest), GFP_NOIO);
-	// if (!dr)
-	// 	return -ENOMEM;
-
-	// dr->bRequestType = usb_req_type;
-	// dr->bRequest = 5;
-	// dr->wValue = cpu_to_le16(addr);
-	// dr->wIndex = cpu_to_le16(0);
-	// dr->wLength = cpu_to_le16(sz);
-
-	// volatile int sem = -100000;
-	// usb_fill_control_urb(urb, usbdev, pipe, (unsigned char *) dr, rtwusb->ctrl_read_buf, sz, ctl_complete, &sem);
-	// io_stat = usb_submit_urb(urb, GFP_ATOMIC);
-	// if (io_stat < 0) {
-	// 	printk(KERN_ERR "Submit error %d\n", io_stat);
-	// }
-	// while (sem == -100000) {
-	// 	usleep_range(10, 1000);
-	// }
-	// io_stat = sem;
-	// usb_free_urb(urb);
-
-	io_stat = usb_control_msg(usbdev, pipe, 5, usb_req_type, (u16) addr, 0, rtwusb->ctrl_read_buf, sz, 1000);
+	io_stat = usb_control_msg(usbdev, pipe, 5, usb_req_type, (u16) addr, 0, (void *) rtwusb->ctrl_read_buf, sz, 1000);
 	// 	if (io_stat == -EPIPE) {
 	// 		// Change to rtw_dbg
 	// 		rtw_dbg(rtwdev, "Repeating %s due to %d\n", req_type == rtw_usb_reg_req_read ? "read" : "write", io_stat);
@@ -665,14 +633,14 @@ inline static int rtw_usb_rw_request(struct rtw_dev *rtwdev, enum rtw_usb_rw_req
 		}
 	}
 
-	// if (addr <= 0xFF || (0x1000 <= addr && addr <= 0x10ff)) {
-	// 	// printk(KERN_INFO "Special update 0x%x\n", addr);
-	// 	// rtw_usb_write8(rtwdev, 0x4e0, u8_io);
-	// 	io_stat2 = usb_control_msg(usbdev, pipe, 5, 0x40, (u16) 0x4e0, 0, rtwusb->ctrl_read_buf, 1, 1000);
-	// 	if (io_stat2 < 1) {
-	// 		rtw_err(rtwdev, "Error submitting write %d\n", io_stat2);
-	// 	}
-	// }
+	// TODO Why we need this? Can this be controlled by module option or chip info?
+	if (addr <= 0xFF || (0x1000 <= addr && addr <= 0x10ff)) {
+		// printk(KERN_INFO "Special update 0x%x\n", addr);
+		io_stat2 = usb_control_msg(usbdev, pipe, 5, 0x40, (u16) 0x4e0, 0, rtwusb->ctrl_read_buf, 1, 1000);
+		if (io_stat2 < 1) {
+			rtw_err(rtwdev, "Error submitting write %d\n", io_stat2);
+		}
+	}
 
 	// Clear - sanity
 	*(u32 *) rtwusb->ctrl_read_buf = 0;
@@ -712,7 +680,6 @@ static u32 rtw_usb_read32(struct rtw_dev *rtwdev, u32 addr)
 static void rtw_usb_write8(struct rtw_dev *rtwdev, u32 addr, u8 val) {
 	u8 out = val;
 	rtw_usb_rw_request(rtwdev, rtw_usb_reg_req_write, addr, &out, sizeof(out));
-	// rtw_usb_write_request(rtwdev, addr, &out, sizeof(out));
 }
 
 static void rtw_usb_write16(struct rtw_dev *rtwdev, u32 addr, u16 val) {
@@ -723,7 +690,6 @@ static void rtw_usb_write16(struct rtw_dev *rtwdev, u32 addr, u16 val) {
 static void rtw_usb_write32(struct rtw_dev *rtwdev, u32 addr, u32 val) {
 	u32 out = cpu_to_le32(val);
 	rtw_usb_rw_request(rtwdev, rtw_usb_reg_req_write, addr, &out, sizeof(out));
-	// rtw_usb_write_request(rtwdev, addr, &out, sizeof(out));
 }
 
 
@@ -752,20 +718,6 @@ static int rtw_usb_init(struct rtw_dev *rtwdev)
 	struct rtw_usb *rtwusb = (struct rtw_usb *)rtwdev->priv;
 	int ret = 0;
 
-	// rtwpci->irq_mask[0] = IMR_HIGHDOK |
-	// 		      IMR_MGNTDOK |
-	// 		      IMR_BKDOK |
-	// 		      IMR_BEDOK |
-	// 		      IMR_VIDOK |
-	// 		      IMR_VODOK |
-	// 		      IMR_ROK |
-	// 		      IMR_BCNDMAINT_E |
-	// 		      0;
-	// rtwpci->irq_mask[1] = IMR_TXFOVW |
-	// 		      0;
-	// rtwpci->irq_mask[3] = IMR_H2CDOK |
-	// 		      0;
-	
 	rtw_dbg(rtwdev, RTW_DBG_USB, "Initializing usb device structure\n");
 
 	spin_lock_init(&rtwusb->ctrl_lock);
@@ -796,7 +748,7 @@ static int rtw_usb_deinit(struct rtw_dev *rtwdev)
 	struct rtw_usb *rtwusb = (struct rtw_usb *)rtwdev->priv;
 	
 	if (rtwusb->ctrl_read_buf) {
-		kfree(rtwusb->ctrl_read_buf);
+		kfree((const void *) rtwusb->ctrl_read_buf);
 	}
 
 	return 0;
@@ -844,56 +796,7 @@ static void rtw_usb_claim(struct rtw_dev *rtwdev, struct usb_interface *usbintf)
 	SET_IEEE80211_DEV(rtwdev->hw, &usbdev->dev);
 }
 
-// To delete interrupt queuue not used?
-static void rtw_usb_rx_complete_int(struct urb *urb) {
-	struct urb *urb_new;
-
-	struct rtw_dev *rtwdev = (struct rtw_dev *) urb->context;
-	struct rtw_usb *rtwusb = (struct rtw_usb *) rtwdev->priv;
-	struct rtw_chip_info *chip = rtwdev->chip;
-
-	struct rtw_rx_pkt_stat pkt_stat;
-
-	struct ieee80211_rx_status rx_status;
-
-int res;
-
-	u32 pkt_offset;
-	u32 pkt_desc_sz = chip->rx_pkt_desc_sz;
-	struct sk_buff *new;
-	u32 new_len;
-
-	u8 *rx_desc;
-
-	if (urb->status != 0) {
-		// Device can get disconnect or other issues, rx watchdog will refill if needed
-		printk(KERN_ERR "Error inc URB %d\n");
-		goto clear;
-	}
-
-	rtwdev->chip->ops->query_rx_desc(rtwdev, urb->transfer_buffer, &pkt_stat, &rx_status);
-
-	printk(KERN_ERR "Inc urb pkt %d \n", (u32) pkt_stat.is_c2h);
-resubmit:	
-	res = usb_submit_urb(urb, GFP_ATOMIC);
-
-	if (res < 0) {
-		// We should analyze errors and repeat or bailout
-		rtw_err(rtwdev, "Error re-submitting RX: %d\n", res);
-		goto clear;
-	}
-
-	return;
-
-clear:
-	atomic_dec(&rtwusb->rx_urbs_in_fly);
-	kfree(urb->transfer_buffer);
-	usb_free_urb(urb);
-}
-
 static void rtw_usb_rx_complete(struct urb *urb) {
-	struct urb *urb_new;
-
 	struct rtw_dev *rtwdev = (struct rtw_dev *) urb->context;
 	struct rtw_usb *rtwusb = (struct rtw_usb *) rtwdev->priv;
 	struct rtw_chip_info *chip = rtwdev->chip;
@@ -986,18 +889,17 @@ static int rtw_usb_rx_thread(void *data) {
 	struct usb_device *usbdev = to_usb_device(rtwdev->dev);
 
 	struct urb* urb;
-	unsigned int pipe, ipipe;
+	unsigned int pipe;
 	void *buff; // Buffers from pool, mapped to DMA(?)
 	int res = 0;	
 
 	pipe = usb_rcvbulkpipe(usbdev, 0x84); //TODO magic
-	ipipe = usb_rcvintpipe(usbdev, 0x87);
 
 	// We are in separte thread, this thread can run during USB disconnect
 	usb_get_dev(usbdev);
 	while (!rtwusb->stop_rx) {
 		// printk(KERN_INFO "recv iteration\n");
-		if (atomic_read(&rtwusb->rx_urbs_in_fly) < 4) {
+		if (atomic_read(&rtwusb->rx_urbs_in_fly) < 10) {
 			rtw_dbg(rtwdev, RTW_DBG_USB, "Adding RX urb & submitting due to exhaustion of RX buffers\n");
 
 			// TODO URBs should be preallocated with DMA coherent and submitted as well
@@ -1016,19 +918,6 @@ static int rtw_usb_rx_thread(void *data) {
 				break;
 			}
 
-			// urb = usb_alloc_urb(0, GFP_ATOMIC);
-			// buff = kmalloc(64 * 1024, GFP_ATOMIC); //TOOD What's a correct size, check again orignal driver, 24kb, 48kb
-			// usb_fill_int_urb(urb, usbdev, ipipe, buff, 64*1024, rtw_usb_rx_complete_int, rtwdev, 1);
-
-			// res = usb_submit_urb(urb, GFP_ATOMIC);
-
-			// if (res < 0) {
-			// 	//TODO Analyze device state - disconnected break, other error continue?
-			// 	rtw_err(rtwdev, "Error submitting RX: %d\n", res);
-			// 	usb_free_urb(urb);
-			// 	kfree(buff);
-			// 	break;
-			// }
 			atomic_inc(&rtwusb->rx_urbs_in_fly);
 			continue;
 		}
@@ -1061,7 +950,7 @@ int rtw_usb_probe(struct usb_interface *usbintf,
 	}
 
 	for (i = 0; i < usbintf->num_altsetting; i++) {
-		printk(KERN_INFO, "-- Alt setting %d\n", i);
+		printk(KERN_INFO "-- Alt setting %d\n", i);
 		struct usb_host_interface *host = usbintf->altsetting + i;
 		
 		printk(KERN_INFO "Num endpoints %hhd\n", host->desc.bNumEndpoints);

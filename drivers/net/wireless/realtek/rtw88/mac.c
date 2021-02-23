@@ -945,6 +945,8 @@ static void __rtw_mac_flush_prio_queue(struct rtw_dev *rtwdev,
 		msleep(20);
 	}
 
+	// TODO FLush can sleep should this happen until queues are flushed?
+	
 	/* priority queue is still not empty, throw a warning,
 	 *
 	 * Note that if we want to flush the tx queue when having a lot of
@@ -952,7 +954,7 @@ static void __rtw_mac_flush_prio_queue(struct rtw_dev *rtwdev,
 	 * And it requires like ~2secs to flush the full priority queue.
 	 */
 	if (!drop)
-		rtw_warn(rtwdev, "timed out to flush queue %d\n", prio_queue);
+		rtw_warn(rtwdev, "timed out to flush queue %d (rsvd %hd / avail %hd)\n", prio_queue, rsvd_page, avail_page);
 }
 
 static void rtw_mac_flush_prio_queues(struct rtw_dev *rtwdev,
