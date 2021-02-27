@@ -42,6 +42,21 @@ static int rtw_usb_tx_schedule(struct rtw_dev *rtwdev,
 static struct urb *rtw_usb_tx_submit(struct rtw_usb_tx_info *tx_info);
 
 struct rtw_usb {
+	// Kernel want to migrate towards drivers working on interfaces, instead of devices
+	struct usb_interface *intf;
+
+	// RX (for now only on blk in supported)
+	unsigned int blkin_pipe;
+	// struct usb_host_endpoint *blkin;
+
+	// TX
+	// struct usb_host_endpoint *dma_to_ep[RTW_DMA_MAPPING_MAX];
+	unsigned int dma_to_pipe[RTW_DMA_MAPPING_MAX];
+
+	unsigned int dma_to_ep_count;
+
+	//unsigned int 
+	
 	// Used during init, to prevent faults during disconnet, when device was not fully initialized
 	struct semaphore init_lock;
 
@@ -244,10 +259,72 @@ void rtw_usb_interface_cfg(struct rtw_dev *rtwdev) {
 
 //rtw_usb_rx_thread
 
+static inline enum rtw_dma_mapping rtw_usb_hw_queue_to_dma_mapping(struct rtw_usb_tx_info *tx_inf) {
+	const struct rtw_rqpn *rqpn = tx_inf->rtwdev->fifo.rqpn;
+
+	/*
+	 * TODO Possible bug of mapping queues and deadlocks.
+	 * 
+	 * The network interface can sometimes stop working and report not flushed TX queue
+	 * (timed out to flush queue...).
+	 * 
+	 * Probably it happens, during device wake up, when conf / mgmt pages are sent
+	 * to one of TX out pipe. If there's already TX URB in progress device do not process it,
+	 * and blocks USB transaction, so subsequent conf / mgmt packets stuck in USB send queue
+	 * and never reach device.
+	 * 
+	 * This can be quite easily recreated by returnign DMA_HIGH from this method, so all packets
+	 * will go through the same USB pipe. Network Manager can show issues with network even in few minutes.
+	 * 
+	 * The current setup (multiple pipes) can only make this less probable, as
+	 * the bcn and conf queue is shared with high prio traffic, which occurs less
+	 * often in reality.
+	 * 
+	 * (Need tripple check this).
+	 */
+	switch (tx_inf->queue)
+	{
+		case RTW_TX_QUEUE_VI:
+			return rqpn->dma_map_vi;
+
+		case RTW_TX_QUEUE_VO:
+			return rqpn->dma_map_vo;
+
+		case RTW_TX_QUEUE_MGMT:
+			return rqpn->dma_map_mg;
+
+		case RTW_TX_QUEUE_HI0:
+			return rqpn->dma_map_hi;
+
+		case RTW_TX_QUEUE_BK:
+			return rqpn->dma_map_bk;
+
+		case RTW_TX_QUEUE_BE:
+			return rqpn->dma_map_be;
+
+		case RTW_TX_QUEUE_H2C:
+		case RTW_TX_QUEUE_BCN:
+			return RTW_DMA_MAPPING_HIGH;
+		
+		default:
+			rtw_warn(tx_inf->rtwdev, "Unexpected queue 0x%hhx (will be mapped to normal)\n", tx_inf->queue);
+			return RTW_DMA_MAPPING_NORMAL;
+	}
+}
+
+static inline unsigned int rtw_usb_hw_queue_to_usb_pipe(struct rtw_usb_tx_info *tx_inf) {
+	struct rtw_usb *rtwusb = (struct rtw_usb *) tx_inf->rtwdev->priv;
+
+	enum rtw_dma_mapping dma_mapping = rtw_usb_hw_queue_to_dma_mapping(tx_inf);
+
+	return rtwusb->dma_to_pipe[dma_mapping];
+}
+
 static struct urb *rtw_usb_tx_submit(struct rtw_usb_tx_info *tx_info) {
 	struct usb_device* usb_dev = to_usb_device(tx_info->rtwdev->dev);
 	struct sk_buff *skb = tx_info->skb;
 	usb_complete_t urb_handler = rtw_usb_process_tx_urb;
+	unsigned int pipe;
 	struct urb* urb;
 	int r;
 
@@ -256,7 +333,8 @@ static struct urb *rtw_usb_tx_submit(struct rtw_usb_tx_info *tx_info) {
 
 	// Here we should chose an endpoint, but we are fine wiih 0x05
 	// Maybe a reason for 'timed out to flush queue 3', but for now it works...
-	usb_fill_bulk_urb(urb, usb_dev, usb_sndbulkpipe(usb_dev, 0x05), skb->data, skb->len, urb_handler, tx_info);
+	pipe = rtw_usb_hw_queue_to_usb_pipe(tx_info);
+	usb_fill_bulk_urb(urb, usb_dev, pipe, skb->data, skb->len, urb_handler, tx_info);
 	r = usb_submit_urb(urb, GFP_NOIO);
 	if (r != 0) {
 		printk(KERN_ERR "Submit urb error %d\n", r);
@@ -543,12 +621,21 @@ static struct rtw_hci_ops rtw_usb_ops = {
 	.write_data_h2c = rtw_usb_write_data_h2c,
 };
 
-static int rtw_usb_init(struct rtw_dev *rtwdev)
+static int rtw_usb_init(struct rtw_dev *rtwdev, struct usb_interface *intf)
 {
 	struct rtw_usb *rtwusb = (struct rtw_usb *)rtwdev->priv;
+	struct usb_host_interface *cur_sett = intf->cur_altsetting;
+	struct usb_device *udev = to_usb_device(rtwdev->dev);
+	
+	struct usb_host_endpoint *endpoint;
+
+	int curr_dma_map = RTW_DMA_MAPPING_MAX - 1;
 	int ret = 0;
+	int i;
 
 	rtw_dbg(rtwdev, RTW_DBG_USB, "Initializing usb device structure\n");
+
+	rtwusb->intf = intf;
 
 	spin_lock_init(&rtwusb->ctrl_lock);
 	// Init read write buffer; avoid allocations later
@@ -556,6 +643,25 @@ static int rtw_usb_init(struct rtw_dev *rtwdev)
 	if (rtwusb->ctrl_read_buf == NULL) {
 		return -ENOMEM;
 	}
+
+	for (i=0; i < cur_sett->desc.bNumEndpoints; i++) {
+		endpoint = &cur_sett->endpoint[i];
+		if (usb_endpoint_is_bulk_out(&endpoint->desc)) {
+			if (curr_dma_map >= 0) {
+				// rtwusb->dma_to_ep[out_count] = endpoint;
+				rtwusb->dma_to_pipe[curr_dma_map] = usb_sndbulkpipe(udev, endpoint->desc.bEndpointAddress);
+				curr_dma_map--;
+			}
+		} else if (usb_endpoint_is_bulk_in(&endpoint->desc)) {
+			// rtwusb->blkin = endpoint;
+			rtwusb->blkin_pipe = usb_rcvbulkpipe(udev, endpoint->desc.bEndpointAddress);
+		}
+	}
+	
+	rtwusb->dma_to_ep_count = RTW_DMA_MAPPING_MAX - curr_dma_map - 1;
+
+	rtw_dbg(rtwdev, RTW_DBG_USB, "Found %d bulk out endpoints\n", rtwusb->dma_to_ep_count);
+	rtwdev->hci.bulkout_num = rtwusb->dma_to_ep_count;
 
 	sema_init(&rtwusb->init_lock, 1);
 
@@ -568,6 +674,7 @@ static int rtw_usb_init(struct rtw_dev *rtwdev)
 
 static int rtw_usb_deinit(struct rtw_dev *rtwdev)
 {
+	// TODO Can be keep in 
 	struct rtw_usb *rtwusb = (struct rtw_usb *)rtwdev->priv;
 	
 	if (rtwusb->ctrl_read_buf) {
@@ -577,7 +684,7 @@ static int rtw_usb_deinit(struct rtw_dev *rtwdev)
 	return 0;
 }
 
-static int rtw_usb_setup_resource(struct rtw_dev *rtwdev, struct usb_interface *usbintf)
+static int rtw_usb_setup_resource(struct rtw_dev *rtwdev, struct usb_interface *intf)
 {
 	struct rtw_usb *rtwusb;
 	int ret;
@@ -592,7 +699,7 @@ static int rtw_usb_setup_resource(struct rtw_dev *rtwdev, struct usb_interface *
 	// 	goto err_out;
 	// }
 
-	ret = rtw_usb_init(rtwdev);
+	ret = rtw_usb_init(rtwdev, intf);
 	if (ret) {
 		rtw_err(rtwdev, "failed to allocate usb resources\n");
 		goto err_out;
@@ -713,11 +820,8 @@ static int rtw_usb_rx_thread(void *data) {
 	struct usb_device *usbdev = to_usb_device(rtwdev->dev);
 
 	struct urb* urb;
-	unsigned int pipe;
 	void *buff; // Buffers from pool, mapped to DMA(?)
-	int res = 0;	
-
-	pipe = usb_rcvbulkpipe(usbdev, 0x84); //TODO magic
+	int res = 0;
 
 	// We are in separte thread, this thread can run during USB disconnect
 	usb_get_dev(usbdev);
@@ -730,7 +834,7 @@ static int rtw_usb_rx_thread(void *data) {
 			// URB submit method should be created
 			urb = usb_alloc_urb(0, GFP_ATOMIC);
 			buff = kmalloc(64 * 1024, GFP_ATOMIC); //TOOD What's a correct size, check again orignal driver, 24kb, 48kb
-			usb_fill_bulk_urb(urb, usbdev, pipe, buff, 64*1024, rtw_usb_rx_complete, rtwdev);
+			usb_fill_bulk_urb(urb, usbdev, rtwusb->blkin_pipe, buff, 64*1024, rtw_usb_rx_complete, rtwdev);
 
 			res = usb_submit_urb(urb, GFP_ATOMIC);
 
@@ -764,7 +868,7 @@ int rtw_usb_probe(struct usb_interface *usbintf,
 	int drv_data_size;
 	int ret;
 
-    // TODO Almost same like for PCIe
+    // TODO Almost same like for PCIe (move to core?)
 	drv_data_size = sizeof(struct rtw_dev) + sizeof(struct rtw_usb);
 	hw = ieee80211_alloc_hw(drv_data_size, &rtw_ops);
 	if (!hw) {
@@ -784,15 +888,13 @@ int rtw_usb_probe(struct usb_interface *usbintf,
 		dev_err(&usbdev->dev, "rtw8822bu: Can't initialize core - %d\n", ret);
 		goto err_release_hw;
 	}
+	// end of Almost same like for PCIe
 
 	rtw_dbg(rtwdev, RTW_DBG_USB,
 		"rtw88 usb probe: vendor=0x%404X product=0x%4.04X\n",
 		usbdev->descriptor.idVendor, usbdev->descriptor.idProduct);
 
-
-	rtwdev->hci.bulkout_num = 3;
-
-	rtw_usb_claim(rtwdev, usbintf);
+	rtw_usb_claim(rtwdev, usbintf); // TODO Move this method body to usb_setup
 
 	ret = rtw_usb_setup_resource(rtwdev, usbintf);
 	if (ret) {

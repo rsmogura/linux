@@ -929,6 +929,7 @@ enum rtw_pq_map_id {
 	RTW_PQ_MAP_UNDEF,
 };
 
+/* order is important for usb pipe mapping */
 enum rtw_dma_mapping {
 	RTW_DMA_MAPPING_EXTRA	= 0,
 	RTW_DMA_MAPPING_LOW	= 1,
