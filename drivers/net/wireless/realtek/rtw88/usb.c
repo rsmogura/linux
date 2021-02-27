@@ -55,6 +55,8 @@ struct rtw_usb {
 
 	unsigned int dma_to_ep_count;
 
+	atomic_t tx_pending_by_queue[RTK_MAX_TX_QUEUE_NUM];
+
 	//unsigned int 
 	
 	// Used during init, to prevent faults during disconnet, when device was not fully initialized
@@ -79,12 +81,15 @@ void rtw_usb_process_tx_urb(struct urb * urb) {
 
 	struct rtw_usb_tx_info *tx_info = (struct rtw_usb_tx_info *) urb->context;
 	struct rtw_dev *rtwdev = tx_info->rtwdev;
-	// struct rtw_usb *rtwusb = 
+	struct rtw_usb *rtwusb = (struct rtw_usb *) rtwdev->priv;
+
 	struct ieee80211_hw *hw = rtwdev->hw;
 	struct sk_buff *skb = tx_info->skb;
 	
 	struct ieee80211_tx_info *info;
 
+	atomic_dec(&rtwusb->tx_pending_by_queue[tx_info->queue]);
+	
 	if (urb->status < 0) {
 		printk(KERN_ERR "Error tx %d\n", urb->status);
 	}
@@ -226,30 +231,36 @@ void rtw_usb_stop(struct rtw_dev *rtwdev) {
 	// WARN_ON(1);
 }
 
-void rtw_usb_deep_ps(struct rtw_dev *rtwdev, bool enter) {
-	// TODO Handle it properly
-	// PWR control causes tx issues... maybe it lack of link_ps, or should we wait for tx to finish
-	// if (enter) {
-	// 	set_bit(RTW_FLAG_LEISURE_PS_DEEP, rtwdev->flags);
-	// 	rtw_power_mode_change(rtwdev, true);
-	// } else {
-	// 	if (test_and_clear_bit(RTW_FLAG_LEISURE_PS_DEEP, rtwdev->flags))
-	// 		rtw_power_mode_change(rtwdev, false);
-	// }
-	// Should be stopped completly, rx thread to suspend
-	// WHen suspended on barrier, disconnect should unsuspend it, to prevent deadlock
-	// Check how often jumps into deep_ps (printk)
-	// Shoould USB power routines be handled here, too?
+static bool rtw_usb_tx_packets_pending(struct rtw_usb *rtwusb) {
+	int i;
+	for (i=0; i < RTK_MAX_TX_QUEUE_NUM; i++) {
+		if (i != RTW_TX_QUEUE_H2C && i != RTW_TX_QUEUE_H2C && 
+				rtwusb->tx_pending_by_queue[i].counter > 0) {
+			return false;
+		}
+	}
 
-	printk(KERN_ERR "deep_ps %d\n", enter);
-	// WARN_ON(1);
+	return true;
+}
+
+void rtw_usb_deep_ps(struct rtw_dev *rtwdev, bool enter) {
+	struct rtw_usb *rtwusb = (struct rtw_usb *) rtwdev->priv;
+
+	if (enter) {
+		if (rtw_usb_tx_packets_pending(rtwusb)) {
+			set_bit(RTW_FLAG_LEISURE_PS_DEEP, rtwdev->flags);
+			rtw_power_mode_change(rtwdev, true);
+		} else {
+			printk(KERN_INFO "Not entering deep ps, packets pending\n");
+		}
+	} else {
+		if (test_and_clear_bit(RTW_FLAG_LEISURE_PS_DEEP, rtwdev->flags))
+			rtw_power_mode_change(rtwdev, false);
+	}
 }
 
 void rtw_usb_link_ps(struct rtw_dev *rtwdev, bool enter) {
-
-	// TODO Handle it properly
-	// Should still be able to recv? Where it was
-	printk(KERN_ERR "link_ps %d\n", enter);
+	// Nothing to do ?
 }
 
 void rtw_usb_interface_cfg(struct rtw_dev *rtwdev) {
@@ -322,6 +333,8 @@ static inline unsigned int rtw_usb_hw_queue_to_usb_pipe(struct rtw_usb_tx_info *
 
 static struct urb *rtw_usb_tx_submit(struct rtw_usb_tx_info *tx_info) {
 	struct usb_device* usb_dev = to_usb_device(tx_info->rtwdev->dev);
+	struct rtw_usb *rtwusb = (struct rtw_usb *) tx_info->rtwdev->priv;
+
 	struct sk_buff *skb = tx_info->skb;
 	usb_complete_t urb_handler = rtw_usb_process_tx_urb;
 	unsigned int pipe;
@@ -335,8 +348,12 @@ static struct urb *rtw_usb_tx_submit(struct rtw_usb_tx_info *tx_info) {
 	// Maybe a reason for 'timed out to flush queue 3', but for now it works...
 	pipe = rtw_usb_hw_queue_to_usb_pipe(tx_info);
 	usb_fill_bulk_urb(urb, usb_dev, pipe, skb->data, skb->len, urb_handler, tx_info);
+	
+	// TODO Check if too many pendings and pause IEEE queue
+	atomic_inc(&rtwusb->tx_pending_by_queue[tx_info->queue]);
 	r = usb_submit_urb(urb, GFP_NOIO);
 	if (r != 0) {
+		atomic_dec(&rtwusb->tx_pending_by_queue[tx_info->queue]);
 		printk(KERN_ERR "Submit urb error %d\n", r);
 		return NULL;
 	}
@@ -662,6 +679,9 @@ static int rtw_usb_init(struct rtw_dev *rtwdev, struct usb_interface *intf)
 
 	rtw_dbg(rtwdev, RTW_DBG_USB, "Found %d bulk out endpoints\n", rtwusb->dma_to_ep_count);
 	rtwdev->hci.bulkout_num = rtwusb->dma_to_ep_count;
+
+	for (i=0; i < RTK_MAX_TX_QUEUE_NUM; i++)
+		atomic_set(&rtwusb->tx_pending_by_queue[i], 0);
 
 	sema_init(&rtwusb->init_lock, 1);
 
