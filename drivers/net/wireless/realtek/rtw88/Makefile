@@ -42,3 +42,6 @@ rtw88_8723de-objs		:= rtw8723de.o
 
 obj-$(CONFIG_RTW88_PCI)		+= rtw88_pci.o
 rtw88_pci-objs			:= pci.o
+
+obj-$(CONFIG_RTW88_USB)		+= rtw88_usb.o
+rtw88_usb-objs			:= usb.o

@@ -16,6 +16,10 @@ config RTW88_CORE
 config RTW88_PCI
 	tristate
 
+config RTW88_USB
+	tristate
+	depends on USB
+
 config RTW88_8822B
 	tristate
 
@@ -39,7 +43,7 @@ config RTW88_8822BE
 config RTW88_8822BU
 	tristate "Realtek 8822BU USB wireless network adapter"
 	select RTW88_CORE
-	select RTW88_PCI
+	select RTW88_USB
 	select RTW88_8822B
 	help
 	  Select this option will enable support for 8822BU chipset
