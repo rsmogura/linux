@@ -90,12 +90,10 @@ void rtw_usb_process_tx_urb(struct urb * urb) {
 
 	atomic_dec(&rtwusb->tx_pending_by_queue[tx_info->queue]);
 	
-	if (urb->status < 0) {
-		printk(KERN_ERR "Error tx %d\n", urb->status);
-	}
+	if (urb->status < 0 && !rtwusb->stop_tx)
+		rtw_err(rtwdev, "Error sending TX URB %d\n", urb->status);
 
 	if (tx_info->ieee80211_packet) {
-
 		// Shift hardware header
 		skb_pull(skb, rtwdev->chip->tx_pkt_desc_sz);
 		info = IEEE80211_SKB_CB(skb);
@@ -103,7 +101,6 @@ void rtw_usb_process_tx_urb(struct urb * urb) {
 		if (!urb->status) {
 			// PCI copy-paste )move to common
 			if (info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS) {
-				printk(KERN_INFO "  ctl status    ctl\n");
 				rtw_tx_report_enqueue(rtwdev, skb, tx_info->sn);
 				goto clear;
 			}
@@ -120,7 +117,7 @@ void rtw_usb_process_tx_urb(struct urb * urb) {
 		ieee80211_tx_status_irqsafe(hw, skb);
 
 	} else {
-		// printk(KERN_INFO "Free skb from sys mgmt\n");
+		// This is driver packet
 		dev_kfree_skb_irq(skb);
 	}
 
@@ -154,8 +151,6 @@ static u8 rtw_usb_hw_queue_mapping(struct sk_buff *skb)
 	else
 		queue = ac_to_hwq[q_mapping];
 
-
-	// printk(KERN_INFO "Queue from skb %hhd, final %hhd\n", q_mapping, queue);
 	return queue;
 }
 
@@ -203,34 +198,28 @@ int rtw_usb_tx_write(struct rtw_dev *rtwdev,
 }
 
 void rtw_usb_tx_kick_off(struct rtw_dev *rtwdev) {
-	// TODO Handle it properly (take better look at it)
-	// No TX thread nothgin to do?
-	// printk(KERN_ERR "kick_off\n");
+	// Nothing to do, no special TX thread
 }
 
 int rtw_usb_setup(struct rtw_dev *rtwdev) {
-
-	// TODO Handle it properly
-	// printk(KERN_ERR "setup\n");
+	// Here we can start RX thread, but this method can be executed few times
 	return 0;
 }
 
 int rtw_usb_start(struct rtw_dev *rtwdev) {
-
-	// TODO Handle it properly
-	printk(KERN_ERR "Here we should start rcv threads & other stuff\n");
-	// TX can't be started here
+	// RX Thread can't be started as it's after driver <-> device comm started
+	// no-op
 	return 0;
 }
 
 void rtw_usb_stop(struct rtw_dev *rtwdev) {
-
-	// TODO Handle it properly
-	printk(KERN_ERR "stop\n");
-
-	// WARN_ON(1);
+	// We could think about cancelting pending IEEE 802.11 URBs here
 }
 
+/**
+ * Check if there are any non management packets pending (submitted but not completed).
+ * It's not atomic.
+ */
 static bool rtw_usb_tx_packets_pending(struct rtw_usb *rtwusb) {
 	int i;
 	for (i=0; i < RTK_MAX_TX_QUEUE_NUM; i++) {
@@ -247,11 +236,10 @@ void rtw_usb_deep_ps(struct rtw_dev *rtwdev, bool enter) {
 	struct rtw_usb *rtwusb = (struct rtw_usb *) rtwdev->priv;
 
 	if (enter) {
+		// Enter deep ps only if nothing to be transmitted
 		if (rtw_usb_tx_packets_pending(rtwusb)) {
 			set_bit(RTW_FLAG_LEISURE_PS_DEEP, rtwdev->flags);
 			rtw_power_mode_change(rtwdev, true);
-		} else {
-			printk(KERN_INFO "Not entering deep ps, packets pending\n");
 		}
 	} else {
 		if (test_and_clear_bit(RTW_FLAG_LEISURE_PS_DEEP, rtwdev->flags))
@@ -264,11 +252,7 @@ void rtw_usb_link_ps(struct rtw_dev *rtwdev, bool enter) {
 }
 
 void rtw_usb_interface_cfg(struct rtw_dev *rtwdev) {
-	// printk(KERN_ERR "interface_cfg\n");
-	// WARN_ON(1);
 }
-
-//rtw_usb_rx_thread
 
 static inline enum rtw_dma_mapping rtw_usb_hw_queue_to_dma_mapping(struct rtw_usb_tx_info *tx_inf) {
 	const struct rtw_rqpn *rqpn = tx_inf->rtwdev->fifo.rqpn;
@@ -341,20 +325,18 @@ static struct urb *rtw_usb_tx_submit(struct rtw_usb_tx_info *tx_info) {
 	struct urb* urb;
 	int r;
 
-	// printk(KERN_INFO "Submit URB to bus\n");
 	urb = usb_alloc_urb(0, GFP_ATOMIC);
-
-	// Here we should chose an endpoint, but we are fine wiih 0x05
-	// Maybe a reason for 'timed out to flush queue 3', but for now it works...
 	pipe = rtw_usb_hw_queue_to_usb_pipe(tx_info);
+	
 	usb_fill_bulk_urb(urb, usb_dev, pipe, skb->data, skb->len, urb_handler, tx_info);
 	
-	// TODO Check if too many pendings and pause IEEE queue
+	// TODO Check if too many pendings and pause IEEE queue (optional)
+	// TODO When submitting URB add timeouts - when packet is missconfigure or something else it will block pipe
 	atomic_inc(&rtwusb->tx_pending_by_queue[tx_info->queue]);
 	r = usb_submit_urb(urb, GFP_NOIO);
 	if (r != 0) {
 		atomic_dec(&rtwusb->tx_pending_by_queue[tx_info->queue]);
-		printk(KERN_ERR "Submit urb error %d\n", r);
+		rtw_err(tx_info->rtwdev, "Error submitting TX URB %d\n", r);
 		return NULL;
 	}
 
@@ -386,12 +368,8 @@ static int rtw_usb_tx_schedule(struct rtw_dev *rtwdev,
 	// Finding issu with this took a lot of time
 	pkt_info->qsel = rtw_usb_get_tx_qsel(skb, queue);
 
-	// printk(KERN_INFO "rtv tx__ >>> tx fw queue %hxx, driver queue %hhx kind %s\n", pkt_info->qsel, queue, rtw_usb_get_frame_kind(skb));
-
 	//update_txdesc from RTL
 	rtw_tx_fill_tx_desc(pkt_info, skb); 
-
-	//We don't set cheksum here - should we?
 
 	// TODO Move cheksum to inlined function
 	chksumdata = (u16 *) skb->data;
@@ -400,8 +378,6 @@ static int rtw_usb_tx_schedule(struct rtw_dev *rtwdev,
 
 	le32p_replace_bits((__le32 *)(skb->data) + 0x07, chksum, GENMASK(15, 0));
 
-	// When packet is miscconfigured no completion, should we cancle URB than? Do test with sending worng packet before good.
-	
 	tx_info->rtwdev = rtwdev;
 	tx_info->pkt_info = pkt_info;
 	tx_info->queue = queue;
@@ -451,7 +427,6 @@ int rtw_usb_write_data_rsvd_page(struct rtw_dev *rtwdev, u8 *buf, u32 size) {
 		rtw_err(rtwdev, "Error TX packet %d\n", ret);
 	}
 
-	// printk(KERN_ERR "rsvd_page\n");
 	return 0;
 }
 
@@ -461,8 +436,6 @@ int rtw_usb_write_data_h2c(struct rtw_dev *rtwdev, u8 *buf, u32 size) {
 	struct rtw_usb_tx_info *tx_info;
 
 	int ret;
-
-	printk(KERN_INFO "write_data_h2c\n");
 
 	skb = rtw_tx_write_data_h2c_get(rtwdev, &pkt_info, buf, size);
 	if (!skb)
@@ -560,7 +533,6 @@ inline static int rtw_usb_rw_request(struct rtw_dev *rtwdev, enum rtw_usb_rw_req
 
 	// TODO Why we need this? Can this be controlled by module option or chip info?
 	if (addr <= 0xFF || (0x1000 <= addr && addr <= 0x10ff)) {
-		// printk(KERN_INFO "Special update 0x%x\n", addr);
 		io_stat2 = usb_control_msg(usbdev, pipe, 5, 0x40, (u16) 0x4e0, 0, (void *) rtwusb->ctrl_read_buf, 1, 1000);
 		if (io_stat2 < 1) {
 			rtw_err(rtwdev, "Error submitting write %d\n", io_stat2);
@@ -767,9 +739,6 @@ int res;
 
 	rtwdev->chip->ops->query_rx_desc(rtwdev, urb->transfer_buffer, &pkt_stat, &rx_status);
 
-
-	// print_hex_dump(KERN_INFO, "rtw_usb: rx", DUMP_PREFIX_OFFSET, 16, 1, urb->transfer_buffer, min(urb->actual_length, 128), false);
-
 	if (urb->status != 0) {
 		// Device can get disconnect or other issues, rx watchdog will refill if needed
 		goto clear;
@@ -783,11 +752,9 @@ int res;
 	pkt_offset = pkt_desc_sz + pkt_stat.drv_info_sz +
 				pkt_stat.shift;
 
-
-	// printk(KERN_INFO " rtw recv %d bytes, status %d, len %hd, shift %hhd, offset=%d, pipe=0x%x\n", urb->actual_length, urb->status, pkt_stat.pkt_len, pkt_stat.shift, pkt_offset, urb->pipe);
 	/* allocate a new skb for this frame,
-		* discard the frame if none available
-		*/
+	 * discard the frame if none available
+	*/
 	new_len = pkt_stat.pkt_len + pkt_offset;
 	new = dev_alloc_skb(new_len);
 	if (WARN_ONCE(!new, "rx routine starvation\n"))
@@ -797,16 +764,9 @@ int res;
 	skb_put_data(new, urb->transfer_buffer, new_len);
 
 	if (pkt_stat.is_c2h) {
-		printk(KERN_INFO "                                 C2H packet\n");
 		rtw_fw_c2h_cmd_rx_irqsafe(rtwdev, pkt_offset, new);
 	} else {
 		/* remove rx_desc */
-		skb_pull(new, pkt_offset);
-
-		// printk(KERN_INFO " rtw recv <<< %s\t%d bytes, status %d, len %hd, shift %hhd, offset=%d\n", rtw_usb_get_frame_kind(new), urb->actual_length, urb->status, pkt_stat.pkt_len, pkt_stat.shift, pkt_offset, urb->pipe);
-
-		// printk(KERN_INFO "   rtw recv %s\n", rtw_usb_get_frame_kind(new));
-
 		rtw_rx_stats(rtwdev, pkt_stat.vif, new);
 		memcpy(new->cb, &rx_status, sizeof(rx_status));
 		if (in_irq())
@@ -846,7 +806,6 @@ static int rtw_usb_rx_thread(void *data) {
 	// We are in separte thread, this thread can run during USB disconnect
 	usb_get_dev(usbdev);
 	while (!rtwusb->stop_rx) {
-		// printk(KERN_INFO "recv iteration\n");
 		if (atomic_read(&rtwusb->rx_urbs_in_fly) < 10) {
 			rtw_dbg(rtwdev, RTW_DBG_USB, "Adding RX urb & submitting due to exhaustion of RX buffers\n");
 
@@ -871,7 +830,7 @@ static int rtw_usb_rx_thread(void *data) {
 		}
 		msleep(1);
 	}
-	printk(KERN_INFO "Exit rx\n");
+	rtw_dbg(rtwdev, RTW_DBG_USB, "exiting rx watchdog thread\n");
 	usb_put_dev(usbdev);
 
 	return 0;
